@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "StarPivot（星枢）HDC 能力网关"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "把 HDC shell 能力封装成本地接口，供其它应用调用"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "星枢"
+    }
+  ]
+}

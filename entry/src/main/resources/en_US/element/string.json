@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "StarPivot HDC capability gateway"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "Wrap HDC shell capabilities into local APIs for other apps"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "StarPivot"
+    }
+  ]
+}
