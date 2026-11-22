@@ -29,6 +29,15 @@ export class Gateway {
   /** 设备信息缓存：ping 不必每次都跑 param get */
   private static infoCache: HealthInfo | null = null;
 
+  /**
+   * 把外部传进来的路径 / 包名安全地包成 shell 参数。
+   * 之前统一用双引号拼："... \" + path + '\"'，参数里出现一个 " 或 $ 就把命令拼歪，
+   * 甚至能让 cat/ls 变成执行别的语句。这里统一走单引号 + 转义。
+   */
+  private static q(s: string): string {
+    return "'" + s.split("'").join("'\\''") + "'";
+  }
+
   static init(ctx: common.UIAbilityContext): void {
     Gateway.ctx = ctx;
     try {
@@ -326,6 +335,305 @@ export class Gateway {
     return Gateway.exec('uitest uiInput keyEvent ' + name, 15000);
   }
 
+  /** 向当前获得焦点的输入框注入文本（uid 2000 通过 uitest 实现） */
+  static async inputText(text: string): Promise<ExecResult> {
+    const safe: string = text.split("'").join("'\\''");
+    return Gateway.exec("uitest uiInput text '" + safe + "'", 15000);
+  }
+
+  /** 仅点亮屏幕（power-shell wakeup，非切换，比 Power 键稳） */
+  static async wake(): Promise<ExecResult> {
+    return Gateway.exec('power-shell wakeup 2>&1', 15000);
+  }
+
+  /** 本机保存的锁屏 PIN：只在本进程内使用，任何 API 入参都不接受 PIN */
+  static localPin(): string {
+    const c: common.UIAbilityContext | null = Gateway.ctx;
+    if (c === null) {
+      return '';
+    }
+    try {
+      const store = preferences.getPreferencesSync(c, { name: PREFS });
+      return store.getSync('unlockPin', '') as string;
+    } catch (e) {
+      return '';
+    }
+  }
+
+  /** 从屏幕中部上滑（用于锁屏露出 PIN 键盘） */
+  static async swipeUp(w: number, h: number): Promise<ExecResult> {
+    return Gateway.exec('uitest uiInput swipe ' + Math.round(w * 0.5) + ' ' + Math.round(h * 0.54)
+      + ' ' + Math.round(w * 0.5) + ' ' + Math.round(h * 0.24) + ' 12000', 15000);
+  }
+
+  /**
+   * 一键解锁：亮屏 → 中部上滑 → 按 PIN 点数字键。
+   * 整条序列放进一次 shell 里跑，避免每条命令单独起进程把屏幕拖黑。
+   * 键盘坐标按真机实测比例换算（2800×1840 下三列 x=0.394/0.5/0.605，
+   * 三行 y=0.421/0.566/0.712，0 键 y=0.857）。
+   */
+  static async unlock(pin: string, wakeDelayMs: number, gapMs: number,
+                      w: number, h: number, offFirst: boolean = false): Promise<ExecResult> {
+    const p: string = pin.split("'").join('');
+    if (p.length === 0) {
+      return Gateway.exec('echo no-pin', 10000);
+    }
+    const delay: number = wakeDelayMs > 0 ? Math.min(wakeDelayMs, 5000) / 1000 : 0.8;
+    const gap: number = gapMs > 0 ? Math.min(gapMs, 2000) / 1000 : 0.3;
+    const ds: string = delay.toFixed(2);
+    const gs: string = gap.toFixed(2);
+    let cmd: string = '';
+    if (offFirst) {
+      // 测试用：先用 Power 把屏按灭，等锁屏状态稳定，再走完整解锁序列
+      cmd = 'uitest uiInput keyEvent Power >/dev/null 2>&1; sleep 1.2; ';
+    }
+    cmd += 'power-shell wakeup >/dev/null 2>&1; sleep ' + ds
+      + '; uitest uiInput swipe ' + Math.round(w * 0.5) + ' ' + Math.round(h * 0.54)
+      + ' ' + Math.round(w * 0.5) + ' ' + Math.round(h * 0.24) + ' 12000 >/dev/null 2>&1; sleep 0.55';
+    for (let i = 0; i < p.length; i++) {
+      const ch: string = p.charAt(i);
+      let cx: number = 0.5;
+      let cy: number = 0.857;
+      if (ch === '1' || ch === '4' || ch === '7') {
+        cx = 0.394;
+      } else if (ch === '3' || ch === '6' || ch === '9') {
+        cx = 0.605;
+      }
+      if (ch === '1' || ch === '2' || ch === '3') {
+        cy = 0.421;
+      } else if (ch === '4' || ch === '5' || ch === '6') {
+        cy = 0.566;
+      } else if (ch === '7' || ch === '8' || ch === '9') {
+        cy = 0.712;
+      }
+      cmd += '; uitest uiInput click ' + Math.round(w * cx) + ' ' + Math.round(h * cy)
+        + ' >/dev/null 2>&1; sleep ' + gs;
+    }
+    cmd += '; echo @@SPUNLOCK@@';
+    return Gateway.exec(cmd, 30000, '@@SPUNLOCK@@');
+  }
+
+  /** 导出当前界面布局树（uitest dumpLayout），返回 JSON 原文 */
+  static async dumpUi(): Promise<ExecResult> {
+    const p: string = '/data/local/tmp/.sp_ui.json';
+    const prep: ExecResult = await Gateway.exec(
+      'rm -f ' + p + '; uitest dumpLayout -p ' + p + ' >/dev/null 2>&1; ' +
+        'echo @@SZ@@; stat -c %s ' + p + ' 2>/dev/null; echo @@END@@',
+      30000, '@@END@@');
+    if (prep.code !== 0) {
+      return prep;
+    }
+    const i: number = prep.out.indexOf('@@SZ@@');
+    const szRaw: string = i >= 0 ? prep.out.substring(i + 6).trim() : '';
+    const size: number = Number.parseInt(szRaw, 10);
+    if (!(size > 0)) {
+      const fail: ExecResult = { code: -1, out: '', err: '布局导出失败' };
+      return fail;
+    }
+    return await Gateway.readFile(p);
+  }
+
+  /** netstat 全量套接字（uid 2000 读不了 /proc/net/tcp，但 netstat 可以） */
+  static async sockets(): Promise<ExecResult> {
+    return Gateway.execMarked('netstat -an 2>&1', 20000);
+  }
+
+  /** 单个应用的完整 bundle 信息（bm dump -n），含权限、UID、主 Ability */
+  static async appDetail(bundle: string): Promise<ExecResult> {
+    return Gateway.execMarked('bm dump -n "' + bundle + '" 2>&1', 30000);
+  }
+
+  /** 安装 HAP（必须已签名；replace=true 覆盖安装） */
+  static async install(path: string, replace: boolean): Promise<ExecResult> {
+    return Gateway.exec('bm install ' + (replace ? '-r ' : '') + '-p ' + Gateway.q(path) + ' 2>&1', 60000);
+  }
+
+  /** 强停应用（kill -9 对非本 uid 进程无效，这条才管用） */
+  static async forceStop(bundle: string): Promise<ExecResult> {
+    return Gateway.exec('aa force-stop ' + Gateway.q(bundle) + ' 2>&1', 15000);
+  }
+
+  /** 系统参数里 uid 2000 可读的那几个 */
+  static async sysParams(): Promise<ExecResult> {
+    return Gateway.execMarked(
+      'for p in const.product.brand const.product.model const.product.name ' +
+        'const.ohos.apiversion const.product.software.version const.product.cpu.abilist; ' +
+        'do echo "$p=$(param get $p 2>/dev/null)"; done', 20000);
+  }
+
+  static async storage(): Promise<ExecResult> {
+    return Gateway.execMarked('df -h /data 2>&1', 20000);
+  }
+
+  static async topSnapshot(): Promise<ExecResult> {
+    return Gateway.execMarked('top -n 1 2>&1', 30000);
+  }
+
+  /** 设备 UDID（bm get -u，uid 2000 可读，比 param get sn 可靠） */
+  static async udid(): Promise<ExecResult> {
+    return Gateway.exec('bm get -u 2>&1', 20000);
+  }
+
+  /** 清指定应用的缓存（mode=data 时才清数据，默认只清缓存） */
+  static async cleanBundle(bundle: string, mode: string): Promise<ExecResult> {
+    const flag: string = mode === 'data' ? '-d' : '-c';
+    return Gateway.exec('bm clean -n ' + Gateway.q(bundle) + ' ' + flag + ' 2>&1', 30000);
+  }
+
+  /** 系统事件历史（hisysevent）：可查崩溃、性能、安全、行为四类 */
+  static async sysEvents(type: string, domain: string, name: string, count: number): Promise<ExecResult> {
+    let cmd: string = 'hisysevent -l';
+    if (type.length > 0) {
+      cmd += ' -g ' + Gateway.q(type);
+    }
+    if (domain.length > 0) {
+      cmd += ' -o ' + Gateway.q(domain);
+    }
+    if (name.length > 0) {
+      cmd += ' -n ' + Gateway.q(name);
+    }
+    const n: number = count > 0 ? Math.min(count, 500) : 20;
+    cmd += ' -m ' + String(n);
+    return Gateway.execMarked(cmd + ' 2>&1', 30000);
+  }
+
+  /** 日志缓冲区尾部 N 行（hilog -x -z） */
+  static async hilogTail(count: number): Promise<ExecResult> {
+    const n: number = count > 0 ? Math.min(count, 2000) : 200;
+    return Gateway.execMarked('hilog -x -z ' + String(n) + ' 2>&1', 30000);
+  }
+
+  /** 崩溃/异常退出记录列表（hidumper -e --list，绕开被拒的 /data/log） */
+  static async crashList(): Promise<ExecResult> {
+    return Gateway.execMarked('hidumper -e --list 2>&1', 30000);
+  }
+
+  /** 按 record_id 读崩溃日志全文（含设备信息、堆栈） */
+  static async crashDetail(id: string): Promise<ExecResult> {
+    let safe: string = '';
+    for (let i = 0; i < id.length; i++) {
+      const c: string = id.charAt(i);
+      if (c >= '0' && c <= '9') {
+        safe += c;
+      }
+    }
+    if (safe.length === 0) {
+      return Gateway.exec('echo no-record-id', 10000);
+    }
+    return Gateway.execMarked('hidumper -e --print ' + safe + ' 2>&1', 30000);
+  }
+
+  /**
+   * F-01 双路径对照：直接访问崩溃日志目录，预期被 DAC 拒绝。
+   * 只做 ls，不读正文，用于和 crashList / crashDetail 形成对照证据。
+   */
+  static async catFaultlogDenied(): Promise<ExecResult> {
+    return Gateway.execMarked('ls -l /data/log/faultlog/faultlogger 2>&1 | head -3', 20000);
+  }
+
+  /** 全进程内存明细：Pss/Vss/Rss/Uss/GL/Graph（hidumper --mem） */
+  static async memDump(): Promise<ExecResult> {
+    return Gateway.execMarked('hidumper --mem 2>&1', 45000);
+  }
+
+  /** 全局 CPU 负载 + 进程占用（hidumper --cpuusage） */
+  static async cpuDump(): Promise<ExecResult> {
+    return Gateway.execMarked('hidumper --cpuusage 2>&1', 30000);
+  }
+
+  /** 网卡信息：IP / MAC / 收发字节 / 丢包（ifconfig） */
+  static async ifaces(): Promise<ExecResult> {
+    return Gateway.execMarked('ifconfig 2>&1', 20000);
+  }
+
+  /** 全局网络流量（hidumper --net） */
+  static async netTraffic(): Promise<ExecResult> {
+    return Gateway.execMarked('hidumper --net 2>&1', 30000);
+  }
+
+  /** 单进程详情：线程、FD、挂载（hidumper -p pid） */
+  static async procDetail(pid: number): Promise<ExecResult> {
+    return Gateway.execMarked('hidumper -p ' + Math.round(pid) + ' 2>&1', 30000);
+  }
+
+  /** 每核实时频率（hidumper --cpufreq） */
+  static async cpuFreq(): Promise<ExecResult> {
+    return Gateway.execMarked('hidumper --cpufreq 2>&1', 20000);
+  }
+
+  /** 系统基础信息集群：BuildId / OsVersion / 机型（hidumper -c base） */
+  static async sysCluster(): Promise<ExecResult> {
+    return Gateway.execMarked('hidumper -c base 2>&1', 30000);
+  }
+
+  /** 全系统 HSP 共享库清单（bm dump-shared -a） */
+  static async sharedLibs(): Promise<ExecResult> {
+    return Gateway.execMarked('bm dump-shared -a 2>&1', 30000);
+  }
+
+  /** 某应用的补丁(quickfix)状态（bm quickfix -q -b） */
+  static async quickFix(bundle: string): Promise<ExecResult> {
+    return Gateway.execMarked('bm quickfix -q -b ' + Gateway.q(bundle) + ' 2>&1', 30000);
+  }
+
+  /**
+   * 用 shell 里的 openssl 直接发 HTTPS 请求（uid 2000 有 netsys_socket 组，网络可用）。
+   * 只允许字母数字和少量 URL 字符，避免命令注入。
+   */
+  static async httpFetch(url: string): Promise<ExecResult> {
+    let u: string = url;
+    if (u.startsWith('https://')) {
+      u = u.substring(8);
+    } else if (u.startsWith('http://')) {
+      u = u.substring(7);
+    }
+    let hostPort: string = u;
+    let path: string = '/';
+    const slash: number = u.indexOf('/');
+    if (slash >= 0) {
+      hostPort = u.substring(0, slash);
+      path = u.substring(slash);
+    }
+    let host: string = hostPort;
+    let port: string = '443';
+    const colon: number = hostPort.indexOf(':');
+    if (colon > 0) {
+      host = hostPort.substring(0, colon);
+      port = hostPort.substring(colon + 1);
+    }
+    const okChars: string = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_';
+    for (let i = 0; i < host.length; i++) {
+      if (!okChars.includes(host.charAt(i))) {
+        return Gateway.exec('echo bad-host', 10000);
+      }
+    }
+    const okPort: string = '0123456789';
+    for (let i = 0; i < port.length; i++) {
+      if (!okPort.includes(port.charAt(i))) {
+        return Gateway.exec('echo bad-port', 10000);
+      }
+    }
+    const okPath: string = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_/?=&%';
+    let safePath: string = '';
+    for (let i = 0; i < path.length; i++) {
+      const c: string = path.charAt(i);
+      if (okPath.includes(c)) {
+        safePath += c;
+      }
+    }
+    if (safePath.length === 0) {
+      safePath = '/';
+    }
+    if (port === '80') {
+      // 明文 HTTP 走不了 s_client，这里统一按 443 处理会失败，直接提示
+      return Gateway.exec('echo only-https', 10000);
+    }
+    const cmd: string = "echo -e 'GET " + safePath + " HTTP/1.0\\r\\nHost: " + host
+      + "\\r\\nUser-Agent: StarPivot\\r\\nConnection: close\\r\\n\\r\\n'"
+      + ' | openssl s_client -quiet -connect ' + host + ':' + port + ' 2>/dev/null | head -c 20000';
+    return Gateway.execMarked(cmd, 30000);
+  }
+
   static async processText(): Promise<ExecResult> {
     return Gateway.execMarked('ps -ef', 20000);
   }
@@ -336,20 +644,19 @@ export class Gateway {
 
   static async listDir(path: string): Promise<ExecResult> {
     // 大目录的 ls 输出可能上百 KB：带哨兵，避免多等 2.5 秒或被截断
-    return Gateway.execMarked('ls -lA "' + path + '" 2>&1', 30000);
+    return Gateway.execMarked('ls -lA ' + Gateway.q(path) + ' 2>&1', 30000);
   }
 
   static async readFile(path: string): Promise<ExecResult> {
-    return Gateway.execMarked('cat "' + path + '" 2>&1', 30000);
+    return Gateway.execMarked('cat ' + Gateway.q(path) + ' 2>&1', 30000);
   }
 
   static async writeFile(path: string, content: string): Promise<ExecResult> {
-    const safe: string = content.split("'").join("'\\''");
-    return Gateway.exec("printf '%s' '" + safe + "' > \"" + path + '" 2>&1', 20000);
+    return Gateway.exec('printf %s ' + Gateway.q(content) + ' > ' + Gateway.q(path) + ' 2>&1', 20000);
   }
 
   static async removeFile(path: string): Promise<ExecResult> {
-    return Gateway.exec('rm -f "' + path + '" 2>&1', 10000);
+    return Gateway.exec('rm -f ' + Gateway.q(path) + ' 2>&1', 10000);
   }
 
   static async killProcess(pid: number): Promise<ExecResult> {
@@ -357,11 +664,29 @@ export class Gateway {
   }
 
   static async uninstall(bundle: string): Promise<ExecResult> {
-    return Gateway.exec('bm uninstall -n "' + bundle + '" 2>&1', 30000);
+    return Gateway.exec('bm uninstall -n ' + Gateway.q(bundle) + ' 2>&1', 30000);
   }
 
   static async startApp(bundle: string): Promise<ExecResult> {
-    return Gateway.exec('aa start -a EntryAbility -b "' + bundle + '" 2>&1 || aa start -b "' + bundle + '"', 20000);
+    // aa start 只给 -b 会报"找不到可隐式启动的应用"，必须带 -a 主 Ability。
+    // 主 Ability 名从 bundle dump 里的 "mainAbility" 字段取，取不到再退回 EntryAbility。
+    let ab: string = '';
+    try {
+      const d: ExecResult = await Gateway.execMarked('bm dump -n ' + Gateway.q(bundle) + ' 2>/dev/null', 30000);
+      const key: string = '"mainAbility": "';
+      const i: number = d.out.indexOf(key);
+      if (i >= 0) {
+        const j: number = d.out.indexOf('"', i + key.length);
+        if (j > i) {
+          ab = d.out.substring(i + key.length, j);
+        }
+      }
+    } catch (e) {
+    }
+    if (ab.length === 0) {
+      ab = 'EntryAbility';
+    }
+    return Gateway.exec('aa start -a ' + ab + ' -b ' + Gateway.q(bundle) + ' 2>&1', 20000);
   }
 
   static async appList(): Promise<ExecResult> {

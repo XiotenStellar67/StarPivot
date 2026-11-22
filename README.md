@@ -1,208 +1,191 @@
-# 星枢 StarPivot
+# StarPivot · 星枢
 
-**鸿蒙版 Shizuku：把 HDC 的 shell 能力封装成本机 HTTP 接口，供其它应用调用。**
+> 把 HarmonyOS 的 **HDC / hdc shell（设备端 uid=2000 shell）** 能力封装成一套本地 HTTP 接口，
+> 供设备上的其它应用调用；同时自带图形界面，可直接操作截屏、进程、文件、应用与诊断。
 
-星枢在你的鸿蒙设备上以 `uid=2000(shell)` 的身份执行截屏、触控注入、进程管理、文件读写、应用启停等操作，
-并把它们包装成一组带令牌鉴权的 `http://127.0.0.1:18790/v1/*` 接口 —— 任何同设备上的应用都能调用，
-不需要 root，也不需要每台设备刷机。
-
-- 包名：`com.starpivot.xs`
-- 版本：1.2.0
-- 平台：HarmonyOS（Stage 模型 / ArkTS / SDK API 26）
-- 许可证：MIT
-
-> 仅在你**自己的设备**上使用。本项目的全部能力都建立在「设备用户主动开启开发者模式并授权调试」这个前提上，
-> 不要用它去操作不属于你的设备。
+**包名** `com.starpivot.xs` ｜ **版本** 1.2.1（versionCode 1002001）｜ **平台** HarmonyOS / OpenHarmony，API 12+，编译 SDK 26
 
 ---
 
 ## 一、它解决什么问题
 
-HarmonyOS 三方应用跑在自己的沙箱 uid 里，**不能**自己 fork 出 `hdc`，也不能以 `shell` 身份跑系统命令。
-所以想要「读别人应用目录、杀进程、截屏、模拟点击」这类能力，就必须先拿到一个 `uid=2000(shell)` 的执行通道。
+三方应用跑在自己的沙箱 uid 下，**没有办法**自己以 `shell` 身份执行系统命令。
+StarPivot 通过两条路径拿到 `uid=2000(shell)` 的执行能力，再把能力统一成 HTTP + 界面：
 
-星枢做两件事：
+1. **本机直连 hdcd（推荐，无需电脑）**：App 内直接与设备上的 `hdcd` 握手（RSA-3072/PSS 签名认证，
+   密钥由 App 自行生成并保存在本应用 preferences），握手成功后拿到 shell 通道。
+2. **PC broker（可选）**：电脑上跑 `pc-broker/broker.js`，用 `hdc rport` 把设备侧回环端口反向映射到电脑，
+   App 通过回环访问 broker，由 broker 调 `hdc shell`。适合 hdcd 直连不可用的机型。
 
-1. **拿到 shell 通道** —— 提供两种互斥的通道实现（见下节）；
-2. **把它变成 API** —— 在设备回环地址上开一个 HTTP 服务，用令牌鉴权，把常用操作固化成一堆稳定接口。
+两条路径在 `Gateway` 里统一抽象，界面与 API 调用方无感切换。
 
-跟 Android 上的 Shizuku 是同构的思路：Shizuku 靠 ADB 拉起一个 shell 进程并通过 binder 分发，
-星枢靠 HDC 协议与 `hdcd` 对话，再通过 HTTP 分发。
-
----
-
-## 二、两种通道
-
-### 1. 免电脑直连（推荐，默认）
-
-鸿蒙设备的开发者模式下，系统自带一个 `hdcd` 守护进程，监听本机回环上的一个端口（实测为 `46751`，
-即 `/proc/net/tcp` 里的十六进制 `B69F`），它的权限就是 `uid=2000(shell)`。
-
-星枢在本进程内直接和这个端口做 **HDCF 帧协议握手**，并用应用自己生成的 RSA-3072 密钥完成鉴权：
-
-```
-App (ArkTS TCPSocket)
-   │  帧头 11 字节：HW 00 00 01 00 | protoLen | 00 | payloadLen
-   │  proto 头：08 ch 10 cmd 18 00 20 09
-   │  payload 字段：1=OHOS HDC, 2=state, 3=ts, 4=target, 5=auth, 6=Ver
-   ▼
-127.0.0.1:<hdcd 端口>  ← 端口不固定，启动时在候选端口里逐个探测 hello 横幅
-   ▼
-uid=2000(shell) 执行命令，stdout 按帧回传
-```
-
-鉴权算法：`RSA-PSS(MGF1-SHA512, saltLen=64)` over `SHA512(nonce)`，密钥对在应用内生成并持久化。
-这条路径**完全不需要电脑**，插不插 USB 都能用。
-
-几个工程上的坑（已在本仓库内修复，供后来者参考）：
-
-- `on('message'/'close'/'error')` 必须在 `connect()` 成功之后才能挂载；
-- `util.TextEncoder.encodeInto()` 对长串会返回 `undefined`，所以自己写了 `encodeUtf8()`；
-- hello 回复的 `state` 字段**不可靠**（实测既有 `state=0` 也有 `state=3`），只能按横幅文本判定；
-- 所有 socket/缓冲状态是全局的，并发建连会把在途回包冲掉，因此连接做了单飞 + 互斥锁，读帧做了增量缓冲。
-
-### 2. 电脑 broker（兼容旧路径）
-
-插着电脑时，也可以用 `pc-broker/broker.js`：App 通过 `hdc rport` 反向映射访问电脑上的 Node 服务，
-由电脑调用 `hdc shell` 执行命令。适合调试或 hdcd 不可用的场景。
-
-App 里有三态开关：`自动`（优先 broker，失败回落本机）/ `仅电脑` / `仅本机`，默认 `自动`。
+> 无论哪条路径，执行身份都是 **uid=2000(shell)**，**不是 root**。读不到 `/data/app`、改不了系统分区。
 
 ---
 
-## 三、界面
+## 二、能力一览
 
-底栏 7 页签：**概览 / 屏幕 / 进程 / 文件 / 应用 / 接口 / 关于**
+界面底栏四项：**概览 / 功能 / 接口 / 关于**。「功能」页左侧侧栏切换七个子页：
 
-- **屏幕**：截屏（可自定义输出分辨率，宽/高各一个输入框，0 = 原分辨率 / 按比例），支持一键存相册、点击/滑动/按键注入
-- **进程**：进程列表 + 结束进程
-- **文件**：目录浏览、搜索、按后缀识别预览文本/图片、写入、删除
-- **应用**：图形化应用列表（中文名优先，小字显示包名）、启动、卸载
-- **接口**：开关本机 HTTP 服务、端口与令牌管理、接口自检
-- **关于**：能力速览、外观入口、运行信息、开源信息
+| 子页 | 能力 |
+|---|---|
+| 屏幕 | 截屏（可指定宽高）、点击、滑动、按键、文本输入、UI dump、保存到相册（走 SaveButton 临时授权） |
+| 进程 | 进程列表、详情、强停 |
+| 文件 | 目录浏览、读取、写入、删除 |
+| 应用 | 应用列表/详情、启动、强停、安装、卸载、清缓存、共享库、quickfix 状态 |
+| 解锁 | 亮屏 → 上滑 → PIN 输入（PIN 只存本机，不接受外部传入） |
+| 诊断 | DFX 固定只读用例、崩溃列表/详情、沙箱隔离对照探测 |
+| 终端 | 任意 shell 命令，自带 cwd 维持、历史 50 条、输出上限 200 KB、单条 30 秒超时 |
 
-设置面板里包含：启动模式切换、**外观设置**（背景 5 档 / 高亮 6 档 / 字号 3 档 / UI 动画开关）、本机接口信息。
+**本地 HTTP 网关**：默认 `127.0.0.1:18790`，除 `/v1/ping` 外全部要求请求头 `X-StarPivot-Token`。
+令牌首次启动随机生成并持久化，可在「接口」页查看/复制。
+
+主要端点（完整列表见 App「接口」页）：
+
+```
+/v1/ping                 /v1/capabilities        /v1/device
+/v1/shell *              /v1/screen/capture      /v1/screen/tap|swipe|key|text
+/v1/ui/dump              /v1/process/list|kill|detail
+/v1/file/list|read|write|remove
+/v1/app/list|detail|start|stop|install|uninstall|clean|shared|patch
+/v1/log/events|hilog|crash|crashDetail
+/v1/device/params|storage|top|udid|memory|cpu|cpufreq|cluster
+/v1/net/sockets|iface|traffic|http
+```
+
+`*` `/v1/shell` **默认关闭**，需在「接口」页的「高危端点」开关里显式打开；打开后每次调用都会写审计日志。
 
 ---
 
-## 四、HTTP 接口
+## 三、构建与运行
 
-服务监听 `127.0.0.1:18790`（端口可改）。除 `/v1/ping` 外，所有请求都要带令牌头：
+> **第一次接触鸿蒙 / 没装过 DevEco？** 先看 [`docs/快速开始.md`](docs/快速开始.md)，
+> 里面是从「下载 DevEco」到「截图成功」的 8 步手把手流程；本节的步骤假设你已经装好环境。
 
-```
-X-StarPivot-Token: <App「接口」页显示的 24 位十六进制令牌>
-```
+### 环境
 
-完整的协议细节、字段表、错误语义、超时建议、并发策略和排查表见
-**[docs/开发者接口文档.md](docs/开发者接口文档.md)**。
+- DevEco Studio（自带 SDK、Node、hvigor、JBR）
+- 一台 API 12+ 的 HarmonyOS 设备，或模拟器
 
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| POST | `/v1/ping` | 健康检查，无需令牌 |
-| POST | `/v1/capabilities` | 列出设备支持的能力 |
-| POST | `/v1/device` | 设备信息（型号 / 系统版本 / 序列号等） |
-| POST | `/v1/shell` | 直接执行自定义命令，返回 stdout |
-| POST | `/v1/screen/capture` | 截屏，返回 base64 JPEG。可选 `width`/`height`（px，0 = 原分辨率/按比例） |
-| POST | `/v1/screen/tap` | 点击坐标 `x`,`y` |
-| POST | `/v1/screen/swipe` | 滑动 `x1`,`y1`,`x2`,`y2` |
-| POST | `/v1/screen/key` | 按键注入 |
-| POST | `/v1/process/list` | 进程列表 |
-| POST | `/v1/process/kill` | 结束进程 |
-| POST | `/v1/file/list` | 目录列表（结构化） |
-| POST | `/v1/file/read` | 读文件 |
-| POST | `/v1/file/write` | 写文件 |
-| POST | `/v1/file/remove` | 删除文件 |
-| POST | `/v1/app/list` | 应用列表 |
-| POST | `/v1/app/start` | 启动应用 |
-| POST | `/v1/app/uninstall` | 卸载应用 |
-
-示例：
-
-```bash
-curl -X POST http://127.0.0.1:18790/v1/ping
-
-curl -X POST http://127.0.0.1:18790/v1/screen/capture \
-  -H "X-StarPivot-Token: <令牌>" -H "Content-Type: application/json" \
-  -d '{"width":1600}'
-```
-
----
-
-## 五、构建
-
-要求：**DevEco Studio**（含 HarmonyOS SDK，API 26）+ Node（DevEco 自带即可）。
+### 构建
 
 ```powershell
-# Windows：脚本会自动定位 DevEco 的 node / hvigor / JDK
-powershell -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
+# DevEco 安装路径不在默认位置时先指定
+$env:DEVECO_HOME = "D:\Program Files\Huawei\DevEco Studio"
+
+.\build.ps1            # debug
+.\build.ps1 -Release   # release（剥调试符号，体积约降 40%）
 ```
 
-产物：`entry/build/default/outputs/default/entry-default-unsigned.hap`（**未签名**）。
+产物：`entry\build\default\outputs\default\entry-default-unsigned.hap`
 
-也可以直接用 DevEco Studio 打开本目录构建。注意 `local.properties` 里的 `sdk.dir` 要改成你自己机器上的 SDK 路径
-（该文件已被 `.gitignore` 排除，需自己创建，或让 DevEco 打开工程时自动生成）。
+也可以用 DevEco Studio 直接打开工程、登录华为账号做自动签名后 Run。
 
-> 工程路径**不要带中文或空格**：hvigor 在含中文的目录下会报 `Invalid project path` 直接失败。
-> 放在 `D:\code\StarPivot` 这类纯英文路径是安全的。
+### 安装
 
-> 构建脚本里把 DevEco 自带的 JDK 放到 PATH 最前，是因为本机 PATH 上的 Oracle JDK 8 会让
-> `app_packing_tool.jar` 崩溃（0xC0000409）。如果你机器上没这问题，直接用 IDE 构建也行。
+```powershell
+hdc install -r <已签名的 hap>
+```
+
+未签名的 HAP 不能装机。签名方式二选一：
+
+1. DevEco Studio 的自动签名（需登录华为账号，会写入 `build-profile.json5` 的 `signingConfigs`）；
+2. 你的调试证书 + profile（设备 UDID 需在 profile 的 `debug-info.device-ids` 里）。
+
+### PC broker（可选）
+
+```powershell
+cd pc-broker
+node broker.js          # 监听 127.0.0.1:18791
+.\cli.ps1 status        # 查看状态；详细用法见 cli.ps1 头部注释
+```
+
+电脑侧需要 `hdc` 在 PATH 中，且设备已 `hdc list targets` 可见。
 
 ---
 
-## 六、签名与安装
-
-仓库**不提供任何签名材料**，也不推荐把签名证书提交进版本库。原因是 HAP 的签名必须和
-你设备的调试授权绑定，别人的证书签出来的包你装不上。
-
-推荐做法：把构建出来的**未签名 HAP** 用平板上的签名工具（例如 HoKit）在本机签名后安装。
-你也可以在 DevEco Studio 里用「自动签名」（登录华为账号 + 真机连接）生成自己的调试证书。
-
-> 这也是本项目的一个设计取向：不做「App 内登录账号换签名」「App 内一键安装」，签名这件事始终留在用户手里。
-
----
-
-## 七、目录
+## 四、目录结构
 
 ```
-StarPivot/
-├─ AppScope/                 应用级配置（bundleName / 版本 / 图标）
-├─ entry/                    主模块
+.
+├─ AppScope/                 应用级配置与图标
+├─ entry/                    主模块（ArkTS / Stage 模型）
 │  └─ src/main/ets/
-│     ├─ common/
-│     │  ├─ LocalHdc.ets     HDCF 帧协议 + RSA-PSS 鉴权 + 端口探测 + 命令执行
-│     │  ├─ Gateway.ets      能力层（resolve / exec / capture / 文件 / 应用）
-│     │  ├─ ApiServer.ets    本机 HTTP 服务，17 条 /v1/* 路由
-│     │  └─ Broker.ets       电脑 broker 客户端
-│     ├─ pages/Index.ets     全部 UI（7 页签 + 设置面板 + 外观设置）
-│     └─ entryability/       Ability 入口
-├─ pc-broker/                电脑端 Node broker（可选）
-├─ docs/
-│  └─ 开发者接口文档.md       协议/字段/错误/示例/排查（调用方必读）
-├─ build.ps1                 命令行构建脚本
-└─ LICENSE                   MIT
+│     ├─ common/ApiServer.ets    本地 HTTP 网关（含令牌校验、体积上限、审计）
+│     ├─ common/Gateway.ets      能力封装，PC / 本机两条通道统一
+│     ├─ common/LocalHdc.ets     免电脑直连 hdcd 的协议实现
+│     ├─ common/Broker.ets       PC broker 客户端
+│     ├─ pages/Index.ets         全部界面
+│     └─ entryability/           入口 Ability
+├─ hvigor/                   构建工具配置
+├─ pc-broker/                电脑侧 broker（Node.js）
+├─ release/                  1.2.1 发行产物（HAP + 发行说明）
+├─ docs/                     零基础文档（快速开始 / 名词解释 / FAQ / 接口调用 / 更新说明）
+├─ build.ps1                 构建脚本（-Release 出发行包）
+├─ XS-UI-设计规格文档.md      配色、字号、间距规范
+├─ README.md / CHANGELOG.md / SECURITY.md / LICENSE
 ```
 
 ---
 
-## 八、已知限制
+## 五、权限
 
-- `hdcd` 端口不固定且会随重启变化，靠候选端口 + hello 探测定位；极端情况下可能探测不到，需要重试
-- `uid=2000` 读不到 `const.product.sn`（`param get` 返回 `errNum 106`），序列号靠回退显示
-- 设备锁屏时无法远程解锁（属系统安全限制）
-- 电脑 broker 方式在拔线后需重新 `hdc rport`
-- 应用图标目前是自绘图标，仓库内未附带第三方素材
+`module.json5` 只声明一条：
+
+| 权限 | 用途 |
+|---|---|
+| `ohos.permission.INTERNET` | HTTP 网关、socket 回环、broker 通信 |
+
+以下是**刻意没有**声明的：
+
+- `WRITE_IMAGEVIDEO`：保存截图走安全控件 `SaveButton` 的临时授权，不需要受限权限；
+- `GET_NETWORK_INFO`：工程内没有 `connection.*` 调用，声明了属于清单不诚实，已移除；
+- `READ_PASTEBOARD`：剪切板只写不读。
 
 ---
 
-## 九、致谢与联系
+## 六、安全边界与使用范围
 
-- 作者：**天狼星蚀**
-- GitHub：[@xiotenstellar67](https://github.com/xiotenstellar67)
-- QQ：1806729469
+- 本工具的全部能力都限制在 **uid=2000(shell)** 的 DAC 权限内，**不具备** root、绕过签名校验、
+  修改系统分区、跨应用读私有目录的能力；相关路径实测返回 `EACCES` / `ENOENT`。
+- 本地网关只监听 `127.0.0.1`，靠令牌鉴权；**仍视为高敏感服务**——任何拿到令牌的本机应用都能调用。
+  请勿在不受信任的设备上长期开启，用完关掉。`/v1/shell` 默认关闭。
+- 「解锁」页的 PIN 存在本应用的 preferences 里，只用于本机自动化，不通过任何接口对外提供。
+- 请仅在自己的设备上使用。用于他人设备前请取得明确授权，并遵守当地法律与平台条款。
 
-思路来自 Android 的 [Shizuku](https://github.com/RikkaApps/Shizuku)，但实现上完全基于鸿蒙 HDC 协议，与 Shizuku 无代码关联。
+---
 
-## License
+## 七、已知限制
 
-MIT © 2026 天狼星蚀
+1. 工程不内置签名材料，HAP 需自行签名。
+2. 应用图标为占位图（首字色块）。
+3. 终端没有 PTY，不支持 `vi`、`top` 这类交互式/持续刷新程序；输出为整段返回，非流式。
+4. `targetSdkVersion` 未显式配置（沿用 compatible 值），构建会有一条 hvigor 提示。
+5. 接口文档以 `docs/接口调用.md` 与 `ApiServer.ets` 为准；接口页的内联说明为速查版。
+6. 仅在 MatePad 11.5 S（SLG-W50，OpenHarmony 7.0.0.111，API 26）上实测；其它机型未验证。
+
+---
+
+## 八、文档索引
+
+| 文档 | 什么时候看 |
+|---|---|
+| [`docs/快速开始.md`](docs/快速开始.md) | 第一次跑这个项目，从装 DevEco 开始 |
+| [`docs/名词解释.md`](docs/名词解释.md) | 不懂 HDC / hdcd / uid=2000 / HAP / profile 是什么意思 |
+| [`docs/常见问题.md`](docs/常见问题.md) | 装不上、连不上、401、`Permission denied`、签名报错 |
+| [`docs/接口调用.md`](docs/接口调用.md) | 要在自己的应用或脚本里调它的接口 |
+| [`docs/更新说明-相对1.2.0.md`](docs/更新说明-相对1.2.0.md) | 想知道 1.2.1 相对上一版改了什么 |
+| [`XS-UI-设计规格文档.md`](XS-UI-设计规格文档.md) | 要改界面配色 / 字号 / 间距 |
+
+---
+
+## 九、许可
+
+MIT，见 [LICENSE](LICENSE)。
+
+第三方组件：仅使用 HarmonyOS 系统 Kit（ArkUI / NetworkKit / CoreFileKit / ArkData / CryptoArchitectureKit 等），
+无外部 npm / ohpm 运行时依赖。`pc-broker` 仅使用 Node.js 内置模块。
+
+---
+
+*作者：天狼星蚀（GitHub: [XiotenStellar67](https://github.com/XiotenStellar67)）*

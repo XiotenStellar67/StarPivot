@@ -1,6 +1,6 @@
-import { common } from '@kit.AbilityKit';
+import { common, bundleManager } from '@kit.AbilityKit';
 import { preferences } from '@kit.ArkData';
-import { pasteboard } from '@kit.BasicServicesKit';
+import { pasteboard, BusinessError } from '@kit.BasicServicesKit';
 import { http } from '@kit.NetworkKit';
 import { util } from '@kit.ArkTS';
 import { fileIo as fs } from '@kit.CoreFileKit';
@@ -9,6 +9,7 @@ import { ApiServer } from '../common/ApiServer';
 import { ExecResult, ProcessItem } from '../common/Broker';
 import { Gateway } from '../common/Gateway';
 import { LocalHdc } from '../common/LocalHdc';
+import { display } from '@kit.ArkUI';
 
 interface FileItem {
   name: string;
@@ -20,6 +21,12 @@ interface FileItem {
 interface AppEntry {
   bundleName: string;
   label: string;
+}
+
+interface DfxCase {
+  label: string;
+  cmd: string;
+  timeout: number;
 }
 
 // 主题色：深灰 × 金黄（XS UI 规格）—— 运行期可被「外观设置」改写，所以用 let
@@ -121,6 +128,20 @@ function applyThemeColors(bgIdx: number, accIdx: number): void {
 @Component
 struct Index {
   @State curTab: number = 0;
+  /** 「功能」页内的子页选择：0 屏幕 / 1 进程 / 2 文件 / 3 应用 / 4 解锁 / 5 诊断 / 6 终端 */
+  @State funcSel: number = 0;
+  /** 功能页侧栏宽度：按窗口宽度自适应（手机窄、平板宽），旋转/分屏时同步变化 */
+  @State sideW: number = 132;
+  /** 从 bundleManager 读取的真实版本串，界面上不再硬编码 */
+  @State appVer: string = '';
+
+  // ---- 终端页 ----
+  @State termCmd: string = '';
+  @State termOut: string = '';
+  @State termHist: string[] = [];
+  @State termCwd: string = '/data/local/tmp';
+  @State termBusy: boolean = false;
+  @State termMsg: string = '';
   @State brokerOk: boolean = false;
   @State channel: string = '未连接';
   @State hdcPort: string = '';
@@ -174,8 +195,37 @@ struct Index {
 
   @State apiOn: boolean = false;
   @State apiPort: string = '18790';
+  /** /v1/shell 是否对第三方应用开放，默认关；开关状态持久化 */
+  @State shellOn: boolean = false;
   @State token: string = '';
   @State apiMsg: string = '';
+
+  @State pinText: string = '';
+  @State unlockDelay: string = '800';
+  @State unlockGap: string = '300';
+  @State unlockMsg: string = '';
+  @State offFirst: boolean = false;
+
+  @State diagMsg: string = '';
+  @State diagText: string = '';
+  @State crashId: string = '';
+  @State urlText: string = 'https://www.baidu.com/';
+
+  @State f01Msg: string = '';
+  @State f01Verdict: string = '';
+  @State f01Text: string = '';
+  @State f01Id: string = '';
+  @State f01Armed: boolean = false;
+
+  // 沙箱隔离探测（只做存在性检查）
+  @State sbxBundle: string = 'com.huawei.hmos.settings';
+  @State sbxResult: string = '';
+  @State sbxMsg: string = '';
+
+  // DFX 调试工具横向排查（只读）
+  @State dfxText: string = '';
+  @State dfxRunning: boolean = false;
+  @State dfxMsg: string = '';
 
   private api: ApiServer = new ApiServer();
 
@@ -198,7 +248,371 @@ struct Index {
     }
     this.loadToken();
     this.restoreApi();
+    this.restoreUnlock();
+    this.loadVer();
     this.checkBroker();
+  }
+
+  /** 版本号从包管理器读，避免硬编码在界面里和 app.json5 对不上（上一版就停在 1.2.0） */
+  private loadVer(): void {
+    try {
+      const info = bundleManager.getBundleInfoForSelfSync(
+        bundleManager.BundleFlag.GET_BUNDLE_INFO_DEFAULT);
+      this.appVer = info.versionName + ' (' + info.versionCode + ')';
+    } catch (e) {
+      this.appVer = '1.2.1 (1002001)';
+    }
+  }
+
+  private restoreUnlock(): void {
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const store = preferences.getPreferencesSync(ctx, { name: 'starpivot' });
+      this.pinText = store.getSync('unlockPin', '') as string;
+      this.unlockDelay = '' + (store.getSync('unlockDelay', 800) as number);
+      this.unlockGap = '' + (store.getSync('unlockGap', 300) as number);
+      this.offFirst = store.getSync('unlockOffFirst', false) as boolean;
+    } catch (e) {
+    }
+  }
+
+  private saveUnlock(): void {
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const store = preferences.getPreferencesSync(ctx, { name: 'starpivot' });
+      store.putSync('unlockPin', this.pinText);
+      store.putSync('unlockDelay', Number.parseInt(this.unlockDelay) || 800);
+      store.putSync('unlockGap', Number.parseInt(this.unlockGap) || 300);
+      store.putSync('unlockOffFirst', this.offFirst);
+      store.flush();
+    } catch (e) {
+    }
+  }
+
+  private async doUnlock(): Promise<void> {
+    if (this.pinText.length === 0) {
+      this.unlockMsg = '先填锁屏 PIN';
+      return;
+    }
+    this.saveUnlock();
+    this.unlockMsg = '执行中…';
+    try {
+      const d = display.getDefaultDisplaySync();
+      const r: ExecResult = await Gateway.unlock(this.pinText,
+        Number.parseInt(this.unlockDelay) || 800,
+        Number.parseInt(this.unlockGap) || 300, d.width, d.height, this.offFirst);
+      this.unlockMsg = r.code === 0 ? '已发送：亮屏 → 上滑 → PIN' : ('失败：' + r.out);
+    } catch (e) {
+      this.unlockMsg = '异常：' + e;
+    }
+  }
+
+  private async doWake(): Promise<void> {    this.unlockMsg = '执行中…';
+    try {
+      const r: ExecResult = await Gateway.wake();
+      this.unlockMsg = r.code === 0 ? '已点亮屏幕' : ('失败：' + r.out);
+    } catch (e) {
+      this.unlockMsg = '异常：' + e;
+    }
+  }
+
+  private async runDiag(kind: string): Promise<void> {
+    this.diagMsg = '读取中…';
+    let r: ExecResult = await Gateway.memDump();
+    if (kind === 'mem') {
+      r = await Gateway.memDump();
+    } else if (kind === 'cpu') {
+      r = await Gateway.cpuDump();
+    } else if (kind === 'crash') {
+      r = await Gateway.crashList();
+    } else if (kind === 'iface') {
+      r = await Gateway.ifaces();
+    } else if (kind === 'traffic') {
+      r = await Gateway.netTraffic();
+    } else if (kind === 'cpufreq') {
+      r = await Gateway.cpuFreq();
+    } else if (kind === 'cluster') {
+      r = await Gateway.sysCluster();
+    } else if (kind === 'shared') {
+      r = await Gateway.sharedLibs();
+    } else if (kind === 'http') {
+      r = await Gateway.httpFetch(this.urlText);
+    } else {
+      r = await Gateway.crashDetail(this.crashId);
+    }
+    this.diagText = r.out;
+    this.diagMsg = r.code === 0 ? '完成' : ('失败：' + r.out);
+  }
+
+  private tokens(line: string): string[] {
+    const out: string[] = [];
+    let cur: string = '';
+    for (let i = 0; i < line.length; i++) {
+      const c: string = line.charAt(i);
+      if (c === ' ' || c === '\t' || c === '\r') {
+        if (cur.length > 0) {
+          out.push(cur);
+          cur = '';
+        }
+      } else {
+        cur += c;
+      }
+    }
+    if (cur.length > 0) {
+      out.push(cur);
+    }
+    return out;
+  }
+
+  /** F-01 对照自查：直接访问被拒 vs 服务代理可读，并统计记录归属分布 */
+  private async runF01(): Promise<void> {
+    this.f01Msg = '自查中…';
+    this.f01Text = '';
+    let catOut: string = '';
+    let listOut: string = '';
+    const cat: ExecResult = await Gateway.catFaultlogDenied();
+    catOut = cat.out;
+    const list: ExecResult = await Gateway.crashList();
+    listOut = list.out;
+
+    let total: number = 0;
+    let own: number = 0;
+    let other: number = 0;
+    let firstOtherId: string = '';
+    const lines: string[] = listOut.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const tk: string[] = this.tokens(lines[i]);
+      if (tk.length < 6) {
+        continue;
+      }
+      if (tk[3] !== 'JsError' && tk[3] !== 'LowMemoryKill' && tk[3] !== 'AppFreeze'
+        && tk[3] !== 'CppCrash' && tk[3] !== 'ProcessExit') {
+        continue;
+      }
+      total++;
+      if (tk[5].startsWith('com.starpivot.xs')) {
+        own++;
+      } else {
+        other++;
+        if (firstOtherId.length === 0) {
+          firstOtherId = tk[4];
+        }
+      }
+    }
+
+    const catDenied: boolean = catOut.indexOf('Permission denied') >= 0;
+    let verdict: string = '';
+    if (catDenied && total > 0) {
+      verdict = '结论：两条路径策略不一致\n'
+        + '· 直接访问 /data/log/faultlog/faultlogger → Permission denied\n'
+        + '· hidumper -e --list → 可列 ' + total + ' 条记录（其中非本应用 ' + other + ' 条）\n'
+        + '· 同一份数据，一条路径被拒、另一条被允许';
+    } else if (!catDenied) {
+      verdict = '对照组未得到 Permission denied，本机策略与此前不同，结论不成立。';
+    } else {
+      verdict = '目录已被拒，但未列出任何崩溃记录，无法形成对照。';
+    }
+    this.f01Verdict = verdict;
+    this.f01Msg = '本应用记录 ' + own + ' 条；非本应用记录 ' + other
+      + ' 条（默认不读取，如需取证请手动确认后填入 record_id）';
+  }
+
+  /** 单条记录读取：需开关已确认，只在本机屏幕显示 */
+  private async runF01Read(): Promise<void> {
+    if (!this.f01Armed) {
+      return;
+    }
+    this.f01Text = '读取中…';
+    const r: ExecResult = await Gateway.crashDetail(this.f01Id);
+    let out: string = r.out;
+    if (out.length > 2200) {
+      out = out.substring(0, 2200) + '\n…（已截断）';
+    }
+    this.f01Text = out;
+  }
+
+  /**
+   * DFX 用例判定：只按输出特征分类，不解析内容、不保存内容。
+   * 拒绝 = 明确的权限拒绝特征；空正文 = 有表头无内容；有数据 = 返回了正文。
+   */
+  private dfxClassify(r: ExecResult): string {
+    if (r.code === -1) {
+      return '连接失败';
+    }
+    const merged: string = (r.out + ' ' + r.err).toLowerCase();
+    if (merged.indexOf('permission denied') >= 0
+      || merged.indexOf('permission check failed') >= 0
+      || merged.indexOf('only supported for debug') >= 0
+      || merged.indexOf('only support debug') >= 0
+      || merged.indexOf('not authorized') >= 0
+      || merged.indexOf('not allowed') >= 0
+      || merged.indexOf('forbidden') >= 0
+      || merged.indexOf('eacces') >= 0) {
+      return '拒绝';
+    }
+    if (r.out.trim().length === 0) {
+      return '空正文';
+    }
+    return '有数据';
+  }
+
+  /**
+   * DFX 调试工具横向排查：按固定清单依次执行只读命令，
+   * 只记录"被拒 / 空正文 / 有数据"和首行摘要，不落盘、不导出、不进 API 列表。
+   */
+  private async runDfx(): Promise<void> {
+    if (this.dfxRunning) {
+      return;
+    }
+    this.dfxRunning = true;
+    this.dfxText = '';
+    const cases: DfxCase[] = [
+      { label: 'hidumper -ls（SystemAbility 清单）', cmd: 'hidumper -ls', timeout: 10000 },
+      { label: 'hidumper --mem（全进程内存明细）', cmd: 'hidumper --mem | head -n 120', timeout: 20000 },
+      { label: 'hidumper --cpuusage（全局 CPU 负载）', cmd: 'hidumper --cpuusage', timeout: 10000 },
+      { label: 'hidumper --cpufreq（每核实时频率）', cmd: 'hidumper --cpufreq', timeout: 10000 },
+      { label: 'hidumper --net（全局网络流量）', cmd: 'hidumper --net | head -n 120', timeout: 15000 },
+      { label: 'hidumper --storage（存储信息）', cmd: 'hidumper --storage | head -n 120', timeout: 15000 },
+      { label: 'hidumper --zip（zip 相关）', cmd: 'hidumper --zip | head -n 120', timeout: 12000 },
+      { label: 'hidumper -p 1（单进程详情, pid=1）', cmd: 'hidumper -p 1', timeout: 10000 },
+      { label: 'hidumper -s RenderService（SA 正文）', cmd: 'hidumper -s RenderService', timeout: 12000 },
+      { label: 'bm dump -a（全系统应用清单）', cmd: 'bm dump -a', timeout: 15000 },
+      { label: 'bm dump -n com.huawei.hmos.settings（他包详情）', cmd: 'bm dump -n com.huawei.hmos.settings | head -n 120', timeout: 15000 },
+      { label: 'bm get -u（设备 UDID）', cmd: 'bm get -u', timeout: 10000 },
+      { label: 'hisysevent -l -g FAULT（故障事件）', cmd: 'hisysevent -l -g FAULT', timeout: 15000 },
+      { label: 'hisysevent -l -g STATISTIC（统计事件）', cmd: 'hisysevent -l -g STATISTIC', timeout: 15000 },
+      { label: 'hilog -x（全局日志）', cmd: 'hilog -x', timeout: 25000 }
+    ];
+
+    let out: string = '';
+    let pass: number = 0;
+    let deny: number = 0;
+    let other: number = 0;
+    for (let i = 0; i < cases.length; i++) {
+      const c: DfxCase = cases[i];
+      let verdict: string = '异常';
+      let head: string = '';
+      let lines: number = 0;
+      try {
+        const r: ExecResult = await Gateway.exec(c.cmd, c.timeout);
+        verdict = this.dfxClassify(r);
+        const body: string = r.out.trim();
+        lines = body.length === 0 ? 0 : body.split('\n').length;
+        const first: string = body.length === 0 ? '(空)' : body.split('\n')[0];
+        head = first.length > 56 ? first.substring(0, 56) + '…' : first;
+      } catch (e) {
+        verdict = '异常';
+      }
+      if (verdict === '有数据') {
+        pass++;
+      } else if (verdict === '拒绝') {
+        deny++;
+      } else {
+        other++;
+      }
+      out += (i + 1) + '. ' + c.label + ' → ' + verdict + '（' + lines + ' 行）\n'
+        + '    $ ' + c.cmd + '\n'
+        + '    首行: ' + head + '\n';
+      this.dfxText = out;
+      this.dfxMsg = '已跑 ' + (i + 1) + '/' + cases.length + ' 条…';
+    }
+
+    out += '\n小结：有数据 ' + pass + ' 条 / 被拒 ' + deny + ' 条 / 空或异常 ' + other + ' 条\n';
+    out += '注：仅记录"是否可读"，未保存任何输出内容，未做任何写操作。';
+    this.dfxText = out;
+    this.dfxMsg = '完成，共 ' + cases.length + ' 条';
+    this.dfxRunning = false;
+  }
+
+  /**
+   * 单个路径的只读探测：只调用 statSync 判断"能否看见"，拿到系统 errno。
+   * 不 open、不 read，因此即使路径可进入也拿不到任何内容。
+   */
+  private probePath(label: string, path: string): string {
+    try {
+      fs.statSync(path);
+      return label + '：可见（exist = true）\n  ' + path;
+    } catch (e) {
+      const err = e as BusinessError;
+      const code: number = err.code;
+      const msg: string = err.message === undefined ? '' : err.message;
+      let kind: string = '不可访问';
+      if (code === 13900002) {
+        kind = '不存在（ENOENT）';
+      } else if (code === 13900012) {
+        kind = '被拒绝（EACCES）';
+      }
+      return label + '：' + kind + '\n  errno = ' + String(code) + '  ' + msg + '\n  ' + path;
+    }
+  }
+
+  /**
+   * 沙箱隔离探测：三组路径，只比对 errno。
+   *   C1 本应用沙箱路径（可见，作为阳性对照）
+   *   C2 本应用宿主路径 /data/app/el2/100/base/<自身包名>（应不可见：命名空间隔离）
+   *   T  他包宿主路径（应不可见或拒绝）
+   * 不读取任何文件内容，不落盘、不上传、不进 API 列表。
+   */
+  private async runSbx(): Promise<void> {
+    const bg: string = this.sbxBundle.trim();
+    if (bg.length === 0) {
+      this.sbxMsg = '请先填写目标包名';
+      return;
+    }
+    let safeBg: string = '';
+    for (let i = 0; i < bg.length; i++) {
+      const c: string = bg.charAt(i);
+      const okChar: boolean = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+        || (c >= '0' && c <= '9') || c === '.' || c === '_';
+      if (okChar) {
+        safeBg += c;
+      }
+    }
+    if (safeBg.length === 0) {
+      this.sbxMsg = '包名只允许字母、数字、点、下划线';
+      return;
+    }
+
+    this.sbxMsg = '探测中…';
+    this.sbxResult = '';
+
+    const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    const ownDir: string = ctx.preferencesDir.length > 0 ? ctx.preferencesDir : (ctx.filesDir + '/preferences');
+    const ownBundle: string = ctx.applicationInfo.name;
+    const ownHost: string = '/data/app/el2/100/base/' + ownBundle;
+    const foreignBase: string = '/data/app/el2/100/base/' + safeBg;
+    const foreignPref: string = foreignBase + '/haps/entry/preferences';
+
+    let r1: string = this.probePath('C1 本应用沙箱 preferences', ownDir);
+    let r2: string = this.probePath('C2 本应用宿主 base（' + ownBundle + '）', ownHost);
+    let r3: string = this.probePath('T1 他包 base（' + safeBg + '）', foreignBase);
+    let r4: string = this.probePath('T2 他包 preferences', foreignPref);
+
+    const c1Ok: boolean = r1.indexOf('可见') >= 0;
+    const c2NoEnt: boolean = r2.indexOf('ENOENT') >= 0;
+    const tEacces: boolean = r3.indexOf('EACCES') >= 0 || r4.indexOf('EACCES') >= 0;
+    const tNoEnt: boolean = r3.indexOf('ENOENT') >= 0 || r4.indexOf('ENOENT') >= 0;
+
+    let verdict: string = '';
+    if (c1Ok && c2NoEnt) {
+      verdict = '结论：应用只能看见自己的沙箱映射（/data/storage/el2/...）；'
+        + '连"本应用自己的宿主路径 /data/app/el2/100/base/<自身包名>"都返回 ENOENT。'
+        + '说明隔离发生在挂载命名空间层——宿主真实路径不在应用的文件视图里，'
+        + '跨应用路径因此是"不可见"而非"被拒绝"，比单纯的 DAC 拒绝更强。';
+      if (tEacces) {
+        verdict += '\n（他包路径额外返回 EACCES：该节点在视图中存在但被安全策略拦截。）';
+      }
+    } else if (c1Ok && tEacces) {
+      verdict = '结论：沙箱路径可见，他包路径返回 EACCES——DAC/SELinux 直接拦截，跨应用读取不成立。';
+    } else if (c1Ok && tNoEnt) {
+      verdict = '结论：沙箱路径可见，他包路径 ENOENT（不可见），未观察到 EACCES，属命名空间级隔离。';
+    } else if (!c1Ok) {
+      verdict = '结论：C1 对照组本身不可达，本机沙箱路径与预期不同，探测结论不成立，请核对 preferencesDir。';
+    } else {
+      verdict = '结论：C1 可见且他包路径也未报错，属异常情形，请人工复核四条 errno。';
+    }
+    this.sbxResult = verdict + '\n\n' + r1 + '\n\n' + r2 + '\n\n' + r3 + '\n\n' + r4;
+    this.sbxMsg = '已比对 4 个路径，未读取任何文件内容';
   }
 
   private fontScaleOf(step: number): number {
@@ -248,6 +662,91 @@ struct Index {
     }, 110);
   }
 
+  /** 功能页侧栏切换子页：不整页淡出，只换内容区，避免每次点击都在等动画 */
+  private switchFunc(i: number): void {
+    if (this.funcSel === i) {
+      return;
+    }
+    this.funcSel = i;
+  }
+
+  /** 侧栏 / 概览快捷入口共用：切子页 + 首次懒加载，避免一切进来就同时打三条命令 */
+  private pickFunc(i: number): void {
+    this.switchFunc(i);
+    if (i === 1 && this.processes.length === 0) {
+      this.loadProcess();
+    }
+    if (i === 2 && this.fileItems.length === 0) {
+      this.loadDir();
+    }
+    if (i === 3 && this.apps.length === 0) {
+      this.doAppList();
+    }
+  }
+
+  /** shell 参数安全引用（与 Gateway 内同名逻辑一致，避免路径里带引号/美元符把命令拼歪） */
+  private sq(s: string): string {
+    return "'" + s.split("'").join("'\\''") + "'";
+  }
+
+  /** 把 TERM 输出追加到面板，整块上限 200KB，防止 cat 大文件把内存吃满 */
+  private pushTerm(text: string): void {
+    let next: string = this.termOut + text;
+    if (next.length > 204800) {
+      next = next.substring(next.length - 204800);
+      next = '…（较早输出已丢弃）\n' + next;
+    }
+    this.termOut = next;
+  }
+
+  /**
+   * 执行一条终端命令。
+   * hdc 的 shell 是非交互 exec，每条命令都是新进程，所以 cd / export 不会自动保留：
+   * 这里用 self.termCwd 手动维持当前目录，纯 `cd xxx` 用 `cd xxx && pwd` 反查真实路径。
+   */
+  private async runTerm(): Promise<void> {
+    const raw: string = this.termCmd.trim();
+    if (raw.length === 0 || this.termBusy) {
+      return;
+    }
+    if (raw === 'clear' || raw === 'cls') {
+      this.termOut = '';
+      this.termCmd = '';
+      return;
+    }
+    this.termBusy = true;
+    this.termMsg = '执行中…';
+    this.termHist = [raw].concat(this.termHist.filter((h: string) => h !== raw)).slice(0, 50);
+    this.termCmd = '';
+    this.pushTerm('\n$ ' + raw + '\n');
+
+    try {
+      let cmd: string = '';
+      const isPureCd: boolean = /^cd\s+[^\s;&|]+$/.test(raw);
+      if (isPureCd) {
+        const target: string = raw.substring(2).trim();
+        cmd = 'cd ' + this.sq(target) + ' && pwd';
+      } else {
+        cmd = 'cd ' + this.sq(this.termCwd) + ' 2>/dev/null; ' + raw;
+      }
+      const r: ExecResult = await Gateway.execMarked(cmd, 30000);
+      const out: string = r.out.length > 0 ? r.out : '(无输出)';
+      if (isPureCd && r.code === 0) {
+        const lines: string[] = out.trim().split('\n');
+        const p: string = lines.length > 0 ? lines[lines.length - 1].trim() : '';
+        if (p.startsWith('/')) {
+          this.termCwd = p;
+        }
+      }
+      this.pushTerm(out.endsWith('\n') ? out : out + '\n');
+      this.termMsg = r.code === 0 ? ('完成 · exit 0 · cwd ' + this.termCwd) : ('失败 · exit ' + r.code + ' · cwd ' + this.termCwd);
+    } catch (e) {
+      this.pushTerm('执行异常：' + e + '\n');
+      this.termMsg = '异常';
+    }
+    this.termBusy = false;
+  }
+
   private restoreApi(): void {
     try {
       const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
@@ -257,6 +756,9 @@ struct Index {
         this.apiPort = '' + p;
       }
       const wasOn = store.getSync('apiOn', false) as boolean;
+      // 默认关闭：shell 是权限最大的一条端点，必须由用户显式打开
+      this.shellOn = store.getSync('apiShell', false) as boolean;
+      this.api.setShell(this.shellOn);
       if (wasOn) {
         this.toggleApi(true);
       }
@@ -270,6 +772,7 @@ struct Index {
       const store = preferences.getPreferencesSync(ctx, { name: 'starpivot' });
       store.putSync('apiOn', on);
       store.putSync('apiPort', this.num(this.apiPort, 18790));
+      store.putSync('apiShell', this.shellOn);
       store.flush();
     } catch (e) {
     }
@@ -804,6 +1307,7 @@ struct Index {
     if (on) {
       try {
         await this.api.start(this.num(this.apiPort, 18790), this.token);
+        this.api.setShell(this.shellOn);
         this.apiOn = true;
         this.saveApi(true);
       } catch (e) {
@@ -933,23 +1437,102 @@ struct Index {
     .justifyContent(FlexAlign.Center)
     .onClick(() => {
       this.switchTab(index);
-      if (index === 2 && this.processes.length === 0) {
-        this.loadProcess();
-      }
-      if (index === 3 && this.fileItems.length === 0) {
-        this.loadDir();
-      }
-      if (index === 4 && this.apps.length === 0) {
-        this.doAppList();
-      }
     })
+  }
+
+  @Builder FuncSideItem(index: number, title: string) {
+    Row({ space: 6 }) {
+      Row()
+        .width(3)
+        .height(16)
+        .borderRadius(2)
+        .backgroundColor(this.funcSel === index ? ACCENT : Color.Transparent)
+      Text(title)
+        .fontSize(fsz(12))
+        .fontWeight(this.funcSel === index ? FontWeight.Bold : FontWeight.Normal)
+        .fontColor(this.funcSel === index ? TEXT : MUTED)
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .layoutWeight(1)
+        .textAlign(TextAlign.Start)
+    }
+    .width('100%')
+    .height(this.sideW < 110 ? 40 : 44)
+    .padding({ left: 8, right: 8 })
+    .borderRadius(10)
+    .backgroundColor(this.funcSel === index ? ACCENT_SOFT : Color.Transparent)
+    .onClick(() => {
+      this.pickFunc(index);
+    })
+  }
+
+  /** 功能页：左窄侧栏 + 右内容区，替代原来的 6 个独立底栏页签 */
+  @Builder FuncTab() {
+    Row() {
+      Column() {
+        Text('功能')
+          .fontSize(fsz(10))
+          .fontColor(MUTED)
+          .width('100%')
+          .padding({ left: 8, top: 10, bottom: 6 })
+
+        // 字号放大后 6 项会超出可视高度，侧栏自己能滚
+        Scroll() {
+          Column({ space: 4 }) {
+            this.FuncSideItem(0, '屏幕')
+            this.FuncSideItem(1, '进程')
+            this.FuncSideItem(2, '文件')
+            this.FuncSideItem(3, '应用')
+            this.FuncSideItem(4, '解锁')
+            this.FuncSideItem(5, '诊断')
+            this.FuncSideItem(6, '终端')
+          }
+          .width('100%')
+          .padding({ bottom: 12 })
+          .alignItems(HorizontalAlign.Start)
+        }
+        .scrollBar(BarState.Off)
+        .edgeEffect(EdgeEffect.Spring)
+        .layoutWeight(1)
+        .width('100%')
+      }
+      .width(this.sideW)
+      .height('100%')
+      .padding({ left: 4, right: 4 })
+      .backgroundColor(BG_DEEP)
+      .borderRadius({ topRight: 14, bottomRight: 14 })
+      .alignItems(HorizontalAlign.Start)
+
+      Column() {
+        if (this.funcSel === 0) {
+          this.ScreenTab()
+        } else if (this.funcSel === 1) {
+          this.ProcessTab()
+        } else if (this.funcSel === 2) {
+          this.FileTab()
+        } else if (this.funcSel === 3) {
+          this.AppTab()
+        } else if (this.funcSel === 4) {
+          this.UnlockTab()
+        } else if (this.funcSel === 5) {
+          this.DiagTab()
+        } else {
+          this.TermTab()
+        }
+      }
+      .layoutWeight(1)
+      .height('100%')
+    }
+    .width('100%')
+    .layoutWeight(1)
+    .alignItems(VerticalAlign.Top)
   }
 
   @Builder Header() {
     Row({ space: 12 }) {
       Column({ space: 2 }) {
         Text('StarPivot').fontSize(fsz(18)).fontWeight(FontWeight.Bold).fontColor(ACCENT)
-        Text('星枢 · HDC 能力网关').fontSize(fsz(12)).fontColor(MUTED)
+        Text('星枢 · HDC 能力网关 · r4').fontSize(fsz(12)).fontColor(MUTED)
       }
       .alignItems(HorizontalAlign.Start)
       .layoutWeight(1)
@@ -984,6 +1567,22 @@ struct Index {
     .layoutWeight(1)
     .backgroundColor(CARD2)
     .borderRadius(14)
+  }
+
+  @Builder QuickCell(title: string, sub: string, idx: number) {
+    Column({ space: 4 }) {
+      Text(title).fontSize(fsz(15)).fontWeight(FontWeight.Bold).fontColor(TEXT)
+      Text(sub).fontSize(fsz(10)).fontColor(MUTED).maxLines(1)
+    }
+    .alignItems(HorizontalAlign.Start)
+    .padding({ left: 12, right: 12, top: 12, bottom: 12 })
+    .layoutWeight(1)
+    .backgroundColor(CARD2)
+    .borderRadius(14)
+    .onClick(() => {
+      this.pickFunc(idx);
+      this.switchTab(1);
+    })
   }
 
   @Builder OverviewTab() {
@@ -1049,6 +1648,20 @@ struct Index {
         if (this.devInfo.length > 0) {
           this.Out(this.devInfo, TEXT)
         }
+
+        this.SectionTitle('快捷功能', '点击直达，六个页签已合并到「功能」')
+        Row({ space: 8 }) {
+          this.QuickCell('屏幕', '截图 / 点击 / 输入', 0)
+          this.QuickCell('进程', '列表 / 详情 / 强停', 1)
+          this.QuickCell('文件', '浏览 / 读写 / 删除', 2)
+        }
+        .width('100%')
+        Row({ space: 8 }) {
+          this.QuickCell('应用', '列表 / 启动 / 安装', 3)
+          this.QuickCell('解锁', '亮屏 / 上滑 / PIN', 4)
+          this.QuickCell('诊断', 'DFX / 探测 / 自查', 5)
+        }
+        .width('100%')
 
         this.SectionTitle('运行日志', '最近 20 条')
         Column({ space: 6 }) {
@@ -1596,6 +2209,411 @@ struct Index {
     .height('100%')
   }
 
+  @Builder UnlockTab() {
+    Scroll() {
+      Column({ space: 12 }) {
+        this.SectionTitle('一键解锁', '亮屏 → 从屏幕中部上滑 → 按 PIN 键盘坐标点按，整条序列一次执行，避免中途熄屏')
+
+        Column({ space: 10 }) {
+          Text('锁屏 PIN').fontSize(fsz(12)).fontColor(MUTED).alignSelf(ItemAlign.Start)
+          TextInput({ text: this.pinText, placeholder: '数字密码，仅保存在本机' })
+            .type(InputType.Number)
+            .maxLength(8)
+            .height(46)
+            .backgroundColor(CARD2)
+            .fontColor(TEXT)
+            .fontSize(fsz(16))
+            .borderRadius(12)
+            .onChange((v: string) => {
+              this.pinText = v;
+            })
+
+          Row({ space: 10 }) {
+            Column({ space: 4 }) {
+              Text('亮屏后延时 ms').fontSize(fsz(11)).fontColor(MUTED)
+              TextInput({ text: this.unlockDelay })
+                .type(InputType.Number)
+                .height(42)
+                .backgroundColor(CARD2)
+                .fontColor(TEXT)
+                .fontSize(fsz(14))
+                .borderRadius(10)
+                .onChange((v: string) => {
+                  this.unlockDelay = v;
+                })
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+
+            Column({ space: 4 }) {
+              Text('按键间隔 ms').fontSize(fsz(11)).fontColor(MUTED)
+              TextInput({ text: this.unlockGap })
+                .type(InputType.Number)
+                .height(42)
+                .backgroundColor(CARD2)
+                .fontColor(TEXT)
+                .fontSize(fsz(14))
+                .borderRadius(10)
+                .onChange((v: string) => {
+                  this.unlockGap = v;
+                })
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+          }
+          .width('100%')
+
+          Row({ space: 10 }) {
+            Column({ space: 2 }) {
+              Text('先熄屏再解锁').fontSize(fsz(13)).fontColor(TEXT)
+              Text('测试用：先用 Power 把屏按灭，1.2 秒后再走完整解锁序列')
+                .fontSize(fsz(10)).fontColor(MUTED)
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
+
+            Toggle({ type: ToggleType.Switch, isOn: this.offFirst })
+              .selectedColor(ACCENT)
+              .onChange((v: boolean) => {
+                this.offFirst = v;
+                this.saveUnlock();
+              })
+          }
+          .width('100%')
+
+          Row({ space: 10 }) {
+            Button('一键解锁')
+              .layoutWeight(1)
+              .height(46)
+              .backgroundColor(ACCENT)
+              .fontColor(ON_ACCENT)
+              .fontSize(fsz(15))
+              .onClick(() => {
+                this.doUnlock();
+              })
+            Button('仅亮屏')
+              .width(110)
+              .height(46)
+              .backgroundColor(CARD2)
+              .fontColor(TEXT)
+              .fontSize(fsz(15))
+              .onClick(() => {
+                this.doWake();
+              })
+          }
+          .width('100%')
+
+          if (this.unlockMsg.length > 0) {
+            Text(this.unlockMsg).fontSize(fsz(12)).fontColor(ACCENT)
+              .alignSelf(ItemAlign.Start)
+          }
+        }
+        .width('100%')
+        .padding(16)
+        .backgroundColor(CARD)
+        .borderRadius(14)
+
+        this.SectionTitle('说明', '坐标实测自 2800×1840 锁屏键盘，其它分辨率会按比例换算')
+        Column({ space: 6 }) {
+          Text('· 键盘三列 x ≈ 0.394 / 0.5 / 0.605，三行 y ≈ 0.421 / 0.566 / 0.712，0 键 y ≈ 0.857')
+            .fontSize(fsz(11)).fontColor(MUTED).alignSelf(ItemAlign.Start)
+          Text('· 亮屏用 power-shell wakeup（非切换），比 Power 键稳，不会把已亮的屏按灭')
+            .fontSize(fsz(11)).fontColor(MUTED).alignSelf(ItemAlign.Start)
+          Text('· 上滑起点在屏幕中部，终点向上 0.3 屏高，速度 12000')
+            .fontSize(fsz(11)).fontColor(MUTED).alignSelf(ItemAlign.Start)
+          Text('· 若某一环失败，把「亮屏后延时」加到 1200ms 再试')
+            .fontSize(fsz(11)).fontColor(MUTED).alignSelf(ItemAlign.Start)
+        }
+        .width('100%')
+        .padding(16)
+        .backgroundColor(CARD)
+        .borderRadius(14)
+
+        Row().height(24)
+      }
+      .padding({ left: 16, right: 16, top: 4, bottom: 24 })
+      .width('100%')
+    }
+    .scrollBar(BarState.Off)
+    .layoutWeight(1)
+  }
+
+  @Builder DiagTab() {
+    Scroll() {
+      Column({ space: 12 }) {
+        this.SectionTitle('系统诊断', '全部走 hidumper 全局选项，uid 2000 可直接读')
+
+        Column({ space: 10 }) {
+          Row({ space: 8 }) {
+            Button('内存全表').layoutWeight(1).height(42).backgroundColor(CARD2).fontColor(TEXT)
+              .fontSize(fsz(13)).onClick(() => { this.runDiag('mem'); })
+            Button('CPU 负载').layoutWeight(1).height(42).backgroundColor(CARD2).fontColor(TEXT)
+              .fontSize(fsz(13)).onClick(() => { this.runDiag('cpu'); })
+            Button('崩溃记录').layoutWeight(1).height(42).backgroundColor(CARD2).fontColor(TEXT)
+              .fontSize(fsz(13)).onClick(() => { this.runDiag('crash'); })
+          }
+          .width('100%')
+          Row({ space: 8 }) {
+            Button('网卡信息').layoutWeight(1).height(42).backgroundColor(CARD2).fontColor(TEXT)
+              .fontSize(fsz(13)).onClick(() => { this.runDiag('iface'); })
+            Button('网络流量').layoutWeight(1).height(42).backgroundColor(CARD2).fontColor(TEXT)
+              .fontSize(fsz(13)).onClick(() => { this.runDiag('traffic'); })
+          }
+          .width('100%')
+          Row({ space: 8 }) {
+            Button('CPU 频率').layoutWeight(1).height(42).backgroundColor(CARD2).fontColor(TEXT)
+              .fontSize(fsz(13)).onClick(() => { this.runDiag('cpufreq'); })
+            Button('系统信息').layoutWeight(1).height(42).backgroundColor(CARD2).fontColor(TEXT)
+              .fontSize(fsz(13)).onClick(() => { this.runDiag('cluster'); })
+            Button('共享库').layoutWeight(1).height(42).backgroundColor(CARD2).fontColor(TEXT)
+              .fontSize(fsz(13)).onClick(() => { this.runDiag('shared'); })
+          }
+          .width('100%')
+
+          Row({ space: 8 }) {
+            TextInput({ text: this.urlText, placeholder: 'https://...' })
+              .layoutWeight(1)
+              .height(42)
+              .backgroundColor(CARD2)
+              .fontColor(TEXT)
+              .fontSize(fsz(12))
+              .borderRadius(10)
+              .onChange((v: string) => {
+                this.urlText = v;
+              })
+            Button('HTTPS 探测')
+              .width(120)
+              .height(42)
+              .backgroundColor(ACCENT)
+              .fontColor(ON_ACCENT)
+              .fontSize(fsz(13))
+              .onClick(() => { this.runDiag('http'); })
+          }
+          .width('100%')
+
+          Row({ space: 8 }) {
+            TextInput({ text: this.crashId, placeholder: '崩溃 record_id' })
+              .layoutWeight(1)
+              .height(42)
+              .backgroundColor(CARD2)
+              .fontColor(TEXT)
+              .fontSize(fsz(13))
+              .borderRadius(10)
+              .onChange((v: string) => {
+                this.crashId = v;
+              })
+            Button('看崩溃详情')
+              .width(120)
+              .height(42)
+              .backgroundColor(ACCENT)
+              .fontColor(ON_ACCENT)
+              .fontSize(fsz(13))
+              .onClick(() => { this.runDiag('detail'); })
+          }
+          .width('100%')
+
+          if (this.diagMsg.length > 0) {
+            Text(this.diagMsg).fontSize(fsz(12)).fontColor(ACCENT).alignSelf(ItemAlign.Start)
+          }
+          if (this.diagText.length > 0) {
+            Text(this.diagText)
+              .fontSize(fsz(10))
+              .fontColor(MUTED)
+              .width('100%')
+              .padding(10)
+              .backgroundColor(BG_DEEP)
+              .borderRadius(10)
+          }
+        }
+        .width('100%')
+        .padding(16)
+        .backgroundColor(CARD)
+        .borderRadius(14)
+
+        // F-01 双路径对照自查（本机取证用，不影响任何网络接口）
+        Column({ space: 10 }) {
+          Text('F-01 双路径对照自查')
+            .fontSize(fsz(13))
+            .fontColor(TEXT)
+            .fontWeight(FontWeight.Medium)
+            .alignSelf(ItemAlign.Start)
+          Text('比对"直接访问崩溃日志目录"与"经服务代理读取"两条路径的策略一致性。结果只在本屏显示，不上传、不落盘、不进 API 列表。')
+            .fontSize(fsz(10))
+            .fontColor(MUTED)
+            .width('100%')
+
+          Button('运行对照自查')
+            .width('100%')
+            .height(42)
+            .backgroundColor(CARD2)
+            .fontColor(TEXT)
+            .fontSize(fsz(13))
+            .onClick(() => { this.runF01(); })
+
+          if (this.f01Verdict.length > 0) {
+            Text(this.f01Verdict)
+              .fontSize(fsz(12))
+              .fontColor(WARN)
+              .width('100%')
+              .padding(10)
+              .backgroundColor(BG_DEEP)
+              .borderRadius(10)
+          }
+          if (this.f01Msg.length > 0) {
+            Text(this.f01Msg).fontSize(fsz(10)).fontColor(MUTED).width('100%')
+          }
+
+          Divider().color(CARD2).margin({ top: 4, bottom: 4 })
+
+          Text('单条记录读取（需先确认）')
+            .fontSize(fsz(12))
+            .fontColor(TEXT)
+            .alignSelf(ItemAlign.Start)
+          Row({ space: 8 }) {
+            Toggle({ type: ToggleType.Switch, isOn: this.f01Armed })
+              .selectedColor(ACCENT)
+              .onChange((on: boolean) => {
+                this.f01Armed = on;
+              })
+            Text('我确认仅在本机取证使用')
+              .fontSize(fsz(11))
+              .fontColor(MUTED)
+              .layoutWeight(1)
+          }
+          .width('100%')
+          Row({ space: 8 }) {
+            TextInput({ text: this.f01Id, placeholder: 'record_id（从列表复制）' })
+              .layoutWeight(1)
+              .height(42)
+              .backgroundColor(CARD2)
+              .fontColor(TEXT)
+              .fontSize(fsz(12))
+              .borderRadius(10)
+              .onChange((v: string) => {
+                this.f01Id = v;
+              })
+            Button('读取')
+              .width(80)
+              .height(42)
+              .backgroundColor(this.f01Armed ? WARN : CARD2)
+              .fontColor(this.f01Armed ? Color.White : MUTED)
+              .fontSize(fsz(13))
+              .enabled(this.f01Armed)
+              .onClick(() => { this.runF01Read(); })
+          }
+          .width('100%')
+
+          if (this.f01Text.length > 0) {
+            Text(this.f01Text)
+              .fontSize(fsz(9))
+              .fontColor(MUTED)
+              .width('100%')
+              .padding(10)
+              .backgroundColor(BG_DEEP)
+              .borderRadius(10)
+          }
+        }
+        .width('100%')
+        .padding(16)
+        .backgroundColor(CARD)
+        .borderRadius(14)
+
+        // 沙箱隔离探测（只读、只比 errno）
+        Column({ space: 10 }) {
+          Text('沙箱隔离探测')
+            .fontSize(fsz(13))
+            .fontColor(TEXT)
+            .fontWeight(FontWeight.Medium)
+            .alignSelf(ItemAlign.Start)
+          Text('对照组＝本应用 preferences 目录；实验组＝另一个包的同一类路径。只做存在性检查，不打开、不读取、不导出任何文件内容。')
+            .fontSize(fsz(10))
+            .fontColor(MUTED)
+            .width('100%')
+          Row({ space: 8 }) {
+            TextInput({ text: this.sbxBundle, placeholder: '目标包名，如 com.huawei.hmos.settings' })
+              .layoutWeight(1)
+              .height(42)
+              .backgroundColor(CARD2)
+              .fontColor(TEXT)
+              .fontSize(fsz(12))
+              .borderRadius(10)
+              .onChange((v: string) => {
+                this.sbxBundle = v;
+              })
+            Button('运行探测')
+              .width(96)
+              .height(42)
+              .backgroundColor(CARD2)
+              .fontColor(TEXT)
+              .fontSize(fsz(13))
+              .onClick(() => { this.runSbx(); })
+          }
+          .width('100%')
+
+          if (this.sbxMsg.length > 0) {
+            Text(this.sbxMsg).fontSize(fsz(10)).fontColor(MUTED).width('100%')
+          }
+          if (this.sbxResult.length > 0) {
+            Text(this.sbxResult)
+              .fontSize(fsz(9))
+              .fontColor(MUTED)
+              .width('100%')
+              .padding(10)
+              .backgroundColor(BG_DEEP)
+              .borderRadius(10)
+          }
+        }
+        .width('100%')
+        .padding(16)
+        .backgroundColor(CARD)
+        .borderRadius(14)
+
+        // DFX 调试工具横向排查（只读）
+        Column({ space: 10 }) {
+          Text('DFX 横向排查（只读）')
+            .fontSize(fsz(13))
+            .fontColor(TEXT)
+            .fontWeight(FontWeight.Medium)
+            .alignSelf(ItemAlign.Start)
+          Text('对 hidumper / bm / hisysevent / hilog 的常用只读子命令逐条试跑，只记录"被拒 / 空正文 / 有数据"，不保存任何输出内容。')
+            .fontSize(fsz(10))
+            .fontColor(MUTED)
+            .width('100%')
+          Button(this.dfxRunning ? '排查中…' : '运行横向排查')
+            .width('100%')
+            .height(44)
+            .backgroundColor(this.dfxRunning ? CARD2 : ACCENT)
+            .fontColor(this.dfxRunning ? MUTED : '#1F1F22')
+            .fontSize(fsz(13))
+            .enabled(!this.dfxRunning)
+            .onClick(() => { this.runDfx(); })
+          if (this.dfxMsg.length > 0) {
+            Text(this.dfxMsg).fontSize(fsz(10)).fontColor(MUTED).width('100%')
+          }
+          if (this.dfxText.length > 0) {
+            Text(this.dfxText)
+              .fontSize(fsz(9))
+              .fontColor(MUTED)
+              .width('100%')
+              .padding(10)
+              .backgroundColor(BG_DEEP)
+              .borderRadius(10)
+          }
+        }
+        .width('100%')
+        .padding(16)
+        .backgroundColor(CARD)
+        .borderRadius(14)
+
+        Row().height(24)
+      }
+      .padding({ left: 16, right: 16, top: 4, bottom: 24 })
+      .width('100%')
+    }
+    .scrollBar(BarState.Off)
+    .layoutWeight(1)
+  }
+
   @Builder ApiRow(m: string, p: string, d: string) {
     Column({ space: 2 }) {
       Row({ space: 8 }) {
@@ -1608,6 +2626,98 @@ struct Index {
     .alignItems(HorizontalAlign.Start)
     .width('100%')
     .padding({ top: 4, bottom: 4 })
+  }
+
+  @Builder TermTab() {
+    Column({ space: 10 }) {
+      this.SectionTitle('终端', 'uid=2000(shell) · 非交互 exec，cd 由本页自行维持')
+
+      Row({ space: 8 }) {
+        Text('cwd').fontSize(fsz(10)).fontColor(MUTED)
+        Text(this.termCwd)
+          .fontSize(fsz(11)).fontColor(ACCENT).fontFamily('monospace')
+          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).layoutWeight(1)
+      }
+      .width('100%')
+      .padding({ left: 4, right: 4 })
+
+      Row({ space: 8 }) {
+        TextInput({ text: $$this.termCmd, placeholder: '例如: ls -l /data/local/tmp' })
+          .height(42).fontSize(fsz(13)).fontFamily('monospace')
+          .backgroundColor(CARD2).fontColor(TEXT).borderRadius(12)
+          .layoutWeight(1)
+          .onSubmit(() => {
+            this.runTerm();
+          })
+        Button(this.termBusy ? '…' : '执行')
+          .height(42).width(64).fontSize(fsz(13))
+          .backgroundColor(this.termBusy ? CARD2 : ACCENT)
+          .fontColor(this.termBusy ? MUTED : ON_ACCENT)
+          .borderRadius(12)
+          .enabled(!this.termBusy)
+          .onClick(() => {
+            this.runTerm();
+          })
+      }
+      .width('100%')
+
+      Row({ space: 8 }) {
+        Text(this.termBusy ? '执行中…' : (this.termMsg.length > 0 ? this.termMsg : '就绪'))
+          .fontSize(fsz(10)).fontColor(this.termBusy ? ACCENT : MUTED).layoutWeight(1).maxLines(1)
+        Text('清屏')
+          .fontSize(fsz(11)).fontColor(MUTED)
+          .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+          .borderRadius(8).backgroundColor(CARD)
+          .onClick(() => {
+            this.termOut = '';
+          })
+      }
+      .width('100%')
+
+      Scroll() {
+        Text(this.termOut.length > 0 ? this.termOut : '$ 输入命令后回车，输出会累积在这里\n$ 支持 pwd / ls / cat / hidumper / dumpsys …')
+          .fontSize(fsz(11))
+          .fontFamily('monospace')
+          .fontColor(this.termOut.length > 0 ? TEXT : MUTED)
+          .width('100%')
+          .textAlign(TextAlign.Start)
+          .copyOption(CopyOptions.LocalDevice)
+      }
+      .align(Alignment.TopStart)
+      .scrollBar(BarState.Off)
+      .width('100%')
+      .layoutWeight(1)
+      .padding(12)
+      .backgroundColor(CARD)
+      .borderRadius(14)
+      .edgeEffect(EdgeEffect.Spring)
+
+      if (this.termHist.length > 0) {
+        Scroll() {
+          Row({ space: 6 }) {
+            ForEach(this.termHist.slice(0, 8), (h: string) => {
+              Text(h)
+                .fontSize(fsz(10)).fontColor(MUTED).fontFamily('monospace')
+                .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+                .layoutWeight(1)
+                .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+                .backgroundColor(CARD2).borderRadius(8)
+                .onClick(() => {
+                  this.termCmd = h;
+                })
+            }, (h: string, idx: number) => idx.toString() + h)
+          }
+        }
+        .scrollable(ScrollDirection.Horizontal)
+        .scrollBar(BarState.Off)
+        .width('100%')
+        .height(30)
+      }
+    }
+    .width('100%')
+    .height('100%')
+    .padding({ left: 16, right: 16, top: 16, bottom: 16 })
+    .alignItems(HorizontalAlign.Start)
   }
 
   @Builder ApiTab() {
@@ -1632,6 +2742,35 @@ struct Index {
         .padding(18)
         .backgroundColor(CARD)
         .borderRadius(18)
+
+        this.SectionTitle('高危端点', '权限最大的一条，默认关闭')
+        Column({ space: 8 }) {
+          Row({ space: 10 }) {
+            Column({ space: 2 }) {
+              Text('/v1/shell').fontSize(fsz(13)).fontColor(TEXT).fontFamily('monospace')
+              Text('允许本机任意应用以 shell 身份执行命令')
+                .fontSize(fsz(11)).fontColor(MUTED).maxLines(2)
+            }
+            .alignItems(HorizontalAlign.Start)
+            .layoutWeight(1)
+            Toggle({ type: ToggleType.Switch, isOn: this.shellOn })
+              .selectedColor(ACCENT)
+              .onChange((v: boolean) => {
+                this.shellOn = v;
+                this.api.setShell(v);
+                this.saveApi(this.apiOn);
+                this.log('shell 端点 ' + (v ? '已开启' : '已关闭'));
+              })
+          }
+          .width('100%')
+          Text('关着的时候该端点直接返回错误，`/v1/capabilities` 也不会列出 shell。App 内的「终端」页不受此开关影响。')
+            .fontSize(fsz(11)).fontColor(MUTED).width('100%')
+        }
+        .alignItems(HorizontalAlign.Start)
+        .padding(18)
+        .backgroundColor(CARD)
+        .borderRadius(18)
+        .width('100%')
 
         this.SectionTitle('网关地址', '仅监听 127.0.0.1，本机应用可直接访问')
         Column({ space: 8 }) {
@@ -1690,7 +2829,7 @@ struct Index {
           this.ApiRow('GET', '/v1/ping', '健康检查（网关与 broker 是否在线）')
           this.ApiRow('GET', '/v1/capabilities', '能力清单与版本')
           this.ApiRow('GET', '/v1/device', '设备信息')
-          this.ApiRow('POST', '/v1/shell', '{"cmd":"..."} 任意 shell 命令')
+          this.ApiRow('POST', '/v1/shell', '{"cmd":"..."} 任意 shell 命令（需开「高危端点」开关）')
           this.ApiRow('POST', '/v1/screen/capture', '截屏，返回 base64 jpeg')
           this.ApiRow('POST', '/v1/screen/tap', '{"x":400,"y":1200}')
           this.ApiRow('POST', '/v1/screen/swipe', '{"x1":400,"y1":1500,"x2":400,"y2":600,"duration":400}')
@@ -1759,7 +2898,7 @@ struct Index {
             }
             .alignItems(VerticalAlign.Bottom)
             Text('HDC 能力网关 · 免电脑直连 · uid=2000(shell)').fontSize(fsz(12)).fontColor(MUTED)
-            Text('v1.2.0 · build 1002000 · com.starpivot.xs').fontSize(fsz(11)).fontColor(MUTED)
+            Text('v' + (this.appVer.length > 0 ? this.appVer : '1.2.1 (1002001)') + ' · com.starpivot.xs').fontSize(fsz(11)).fontColor(MUTED)
           }
           .alignItems(HorizontalAlign.Start)
           .layoutWeight(1)
@@ -1853,7 +2992,8 @@ struct Index {
         this.SectionTitle('运行信息', '当前会话')
         Column({ space: 12 }) {
           this.AboutRow('包名', 'com.starpivot.xs')
-          this.AboutRow('版本', '1.2.0 (1002000)')
+          this.AboutRow('构建批次', 'r4 · 底栏合并版 + 终端页 + shell 端点开关')
+          this.AboutRow('版本', this.appVer.length > 0 ? this.appVer : '1.2.1 (1002001)')
           this.AboutRow('执行身份', this.ident.length > 0 ? this.ident : 'uid=2000(shell)')
           this.AboutRow('当前通道', this.brokerOk ? this.channel : '未连接')
           this.AboutRow('本机接口', 'http://127.0.0.1:' + this.apiPort)
@@ -2062,14 +3202,8 @@ struct Index {
           if (this.curTab === 0) {
             this.OverviewTab()
           } else if (this.curTab === 1) {
-            this.ScreenTab()
+            this.FuncTab()
           } else if (this.curTab === 2) {
-            this.ProcessTab()
-          } else if (this.curTab === 3) {
-            this.FileTab()
-          } else if (this.curTab === 4) {
-            this.AppTab()
-          } else if (this.curTab === 5) {
             this.ApiTab()
           } else {
             this.AboutTab()
@@ -2081,12 +3215,9 @@ struct Index {
 
         Row() {
           this.TabItem(0, '概览')
-          this.TabItem(1, '屏幕')
-          this.TabItem(2, '进程')
-          this.TabItem(3, '文件')
-          this.TabItem(4, '应用')
-          this.TabItem(5, '接口')
-          this.TabItem(6, '关于')
+          this.TabItem(1, '功能')
+          this.TabItem(2, '接口')
+          this.TabItem(3, '关于')
         }
         .width('100%')
         .height(58)
@@ -2106,6 +3237,16 @@ struct Index {
     }
     .width('100%')
     .height('100%')
+    // 侧栏宽度跟窗口宽度走：手机窄一点、平板保持 132，分屏/旋转时也会重算
+    .onAreaChange((oldArea: Area, newArea: Area) => {
+      const w: number = Number(newArea.width);
+      if (w > 0) {
+        const next: number = w < 360 ? 80 : (w < 600 ? 92 : 132);
+        if (next !== this.sideW) {
+          this.sideW = next;
+        }
+      }
+    })
   }
 }
 

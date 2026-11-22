@@ -13,11 +13,11 @@
     "installationFree": false,
     "pages": "$profile:main_pages",
     "requestPermissions": [
+      // 唯一需要的权限：http/socket 走本机回环与 broker 通信。
+      // 1.2.1 起移除 ohos.permission.GET_NETWORK_INFO —— 全工程没有 connection.* 调用，
+      // 声明了却不用属于"权限清单不诚实"，也给静态扫描留了多余面。
       {
         "name": "ohos.permission.INTERNET"
-      },
-      {
-        "name": "ohos.permission.GET_NETWORK_INFO"
       }
     ],
     "abilities": [
